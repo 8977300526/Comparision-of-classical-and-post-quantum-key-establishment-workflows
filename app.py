@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa, x25519
+from cryptography.hazmat.primitives.asymmetric import mlkem, padding, rsa, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import (
@@ -21,7 +21,7 @@ from cryptography.hazmat.primitives.serialization import (
     PrivateFormat,
     PublicFormat,
 )
-from cryptography.exceptions import InvalidTag
+from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
 
 try:
     import oqs
@@ -53,11 +53,38 @@ TIME_METRICS = {
 
 def inspect_mlkem_support() -> Tuple[bool, Optional[Dict[str, Any]], str]:
     """Check that both the Python wrapper and native ML-KEM implementation work."""
+    try:
+        private_key = mlkem.MLKEM768PrivateKey.generate()
+        public_key = private_key.public_key()
+        shared_secret, ciphertext = public_key.encapsulate()
+        receiver_secret = private_key.decapsulate(ciphertext)
+        if shared_secret != receiver_secret:
+            raise RuntimeError("ML-KEM-768 encapsulation verification failed.")
+        details = {
+            "backend": "cryptography",
+            "length_public_key": len(public_key.public_bytes_raw()),
+            "length_secret_key": len(private_key.private_bytes_raw()),
+            "length_ciphertext": len(ciphertext),
+            "length_shared_secret": len(shared_secret),
+        }
+        return True, details, ""
+    except (
+        AttributeError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        UnsupportedAlgorithm,
+        ValueError,
+    ):
+        pass
+
     if oqs is None:
         return (
             False,
             None,
-            " ",
+            "ML-KEM-768 is unavailable: install cryptography>=50 or a "
+            "compatible liboqs-python/native liboqs build.",
         )
 
     try:
@@ -208,16 +235,26 @@ def benchmark_key_generation(
                 algorithm, private_key, private_key.public_key(), None
             )
     elif algorithm == MLKEM_NAME:
-        if oqs is None or mlkem_details is None:
+        if mlkem_details is None:
             raise RuntimeError("ML-KEM-768 is unavailable in the current environment.")
-        with oqs.KeyEncapsulation(MLKEM_NAME) as kem:
+        if mlkem_details.get("backend") == "cryptography":
             for _ in range(repetitions):
                 started = time.perf_counter()
-                public_key = kem.generate_keypair()
+                private_key = mlkem.MLKEM768PrivateKey.generate()
                 samples.append(time.perf_counter() - started)
-                public_size, private_size = _key_generation_sizes(
-                    algorithm, None, public_key, mlkem_details
-                )
+                public_size = len(private_key.public_key().public_bytes_raw())
+                private_size = len(private_key.private_bytes_raw())
+        else:
+            if oqs is None:
+                raise RuntimeError("ML-KEM-768 is unavailable in the current environment.")
+            with oqs.KeyEncapsulation(MLKEM_NAME) as kem:
+                for _ in range(repetitions):
+                    started = time.perf_counter()
+                    public_key = kem.generate_keypair()
+                    samples.append(time.perf_counter() - started)
+                    public_size, private_size = _key_generation_sizes(
+                        algorithm, None, public_key, mlkem_details
+                    )
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
@@ -276,22 +313,36 @@ def benchmark_key_establishment(
                 raise ValueError("X25519 parties derived different shared secrets.")
             samples.append(time.perf_counter() - started)
     elif algorithm == MLKEM_NAME:
-        if oqs is None or mlkem_details is None:
+        if mlkem_details is None:
             raise RuntimeError("ML-KEM-768 is unavailable in the current environment.")
-        with oqs.KeyEncapsulation(MLKEM_NAME) as kem:
-            recipient_public = kem.generate_keypair()
+        if mlkem_details.get("backend") == "cryptography":
+            recipient_private = mlkem.MLKEM768PrivateKey.generate()
+            recipient_public = recipient_private.public_key()
             for _ in range(repetitions):
                 started = time.perf_counter()
-                ciphertext, sender_secret = kem.encap_secret(recipient_public)
-                receiver_secret = kem.decap_secret(ciphertext)
+                sender_secret, ciphertext = recipient_public.encapsulate()
+                receiver_secret = recipient_private.decapsulate(ciphertext)
                 if len(ciphertext) != int(mlkem_details["length_ciphertext"]):
-                    raise ValueError(
-                        "ML-KEM-768 ciphertext size does not match liboqs metadata."
-                    )
+                    raise ValueError("ML-KEM-768 ciphertext size is unexpected.")
                 if sender_secret != receiver_secret:
                     raise ValueError("ML-KEM-768 parties derived different secrets.")
                 ciphertext_size = len(ciphertext)
                 samples.append(time.perf_counter() - started)
+        else:
+            if oqs is None:
+                raise RuntimeError("ML-KEM-768 is unavailable in the current environment.")
+            with oqs.KeyEncapsulation(MLKEM_NAME) as kem:
+                recipient_public = kem.generate_keypair()
+                for _ in range(repetitions):
+                    started = time.perf_counter()
+                    ciphertext, sender_secret = kem.encap_secret(recipient_public)
+                    receiver_secret = kem.decap_secret(ciphertext)
+                    if len(ciphertext) != int(mlkem_details["length_ciphertext"]):
+                        raise ValueError("ML-KEM-768 ciphertext size does not match metadata.")
+                    if sender_secret != receiver_secret:
+                        raise ValueError("ML-KEM-768 parties derived different secrets.")
+                    ciphertext_size = len(ciphertext)
+                    samples.append(time.perf_counter() - started)
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
@@ -349,12 +400,19 @@ def establish_aes_key(
         return _derive_aes_key(alice_secret)
 
     if algorithm == MLKEM_NAME:
-        if oqs is None or mlkem_details is None:
+        if mlkem_details is None:
             raise RuntimeError("ML-KEM-768 is unavailable in the current environment.")
-        with oqs.KeyEncapsulation(MLKEM_NAME) as kem:
-            recipient_public = kem.generate_keypair()
-            ciphertext, sender_secret = kem.encap_secret(recipient_public)
-            receiver_secret = kem.decap_secret(ciphertext)
+        if mlkem_details.get("backend") == "cryptography":
+            recipient_private = mlkem.MLKEM768PrivateKey.generate()
+            sender_secret, ciphertext = recipient_private.public_key().encapsulate()
+            receiver_secret = recipient_private.decapsulate(ciphertext)
+        else:
+            if oqs is None:
+                raise RuntimeError("ML-KEM-768 is unavailable in the current environment.")
+            with oqs.KeyEncapsulation(MLKEM_NAME) as kem:
+                recipient_public = kem.generate_keypair()
+                ciphertext, sender_secret = kem.encap_secret(recipient_public)
+                receiver_secret = kem.decap_secret(ciphertext)
         if sender_secret != receiver_secret:
             raise ValueError("ML-KEM-768 shared-secret verification failed.")
         return _derive_aes_key(receiver_secret)
